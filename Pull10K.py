@@ -1,16 +1,35 @@
+import json
 import os
 import re
 import subprocess
 from pathlib import Path
 
+import requests
 from sec_edgar_downloader import Downloader
 
 CHROME_BIN = "google-chrome"
 PERIOD_RE = re.compile(r"CONFORMED PERIOD OF REPORT:\s*(\d{4})")
+CIK_RE = re.compile(r"CENTRAL INDEX KEY:\s*(\d+)")
+IMG_SRC_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
 
 # Resolve relative to this script's own folder, so it works no matter
 # what directory you launch it from.
 script_dir = os.path.dirname(os.path.abspath(__file__))
+
+# SEC EDGAR requires every request to identify a name and email address
+# (see https://www.sec.gov/os/webmaster-faq#developers). Ask for it once
+# and reuse the saved values on later runs.
+identity_path = Path(script_dir) / ".edgar_identity.json"
+if identity_path.exists():
+    identity = json.loads(identity_path.read_text())
+else:
+    print("SEC EDGAR requires a name and email address to identify requests.")
+    identity = {
+        "name": input("Your name or organization: ").strip(),
+        "email": input("Your email address: ").strip(),
+    }
+    identity_path.write_text(json.dumps(identity))
+
 symbol = input("Company symbol: ").strip().upper()
 
 symbol_dir = Path(script_dir) / symbol
@@ -27,7 +46,7 @@ existing_years = {
     if (match := re.search(r"(\d{4})\.pdf$", path.name))
 }
 
-dl = Downloader("Null", "sec.gov.proximity851@simplelogin.com", str(cache_dir))
+dl = Downloader(identity["name"], identity["email"], str(cache_dir))
 
 # download_details=True also fetches the clean primary filing document
 # (not just the raw full-submission text dump), which is what we convert.
@@ -52,6 +71,31 @@ for accession_dir in sorted(p for p in filings_root.iterdir() if p.is_dir()):
     if not primary_docs:
         print(f"Skipping {accession_dir.name}: no primary document found")
         continue
+    primary_doc = primary_docs[0]
+
+    # The primary document references images (charts, logos) that SEC
+    # EDGAR serves as separate files. Fetch any not already cached so
+    # Chrome can find them locally when rendering the page.
+    cik_match = CIK_RE.search(full_submission.read_text(errors="ignore"))
+    if cik_match:
+        cik = cik_match.group(1).lstrip("0")
+        accession_no_dashes = accession_dir.name.replace("-", "")
+        html = primary_doc.read_text(errors="ignore")
+        for image_name in IMG_SRC_RE.findall(html):
+            if image_name.startswith(("http://", "https://", "data:")):
+                continue
+            image_path = accession_dir / image_name
+            if image_path.exists():
+                continue
+            url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_no_dashes}/{image_name}"
+            try:
+                resp = requests.get(url, headers={"User-Agent": dl.user_agent}, timeout=30)
+                if resp.ok:
+                    image_path.write_bytes(resp.content)
+                else:
+                    print(f"Could not fetch image {image_name} for {accession_dir.name}: HTTP {resp.status_code}")
+            except requests.RequestException as e:
+                print(f"Could not fetch image {image_name} for {accession_dir.name}: {e}")
 
     pdf_path = annual_reports_dir / f"{symbol}-10K-{year}.pdf"
     try:
@@ -62,8 +106,8 @@ for accession_dir in sorted(p for p in filings_root.iterdir() if p.is_dir()):
                 "--disable-gpu",
                 "--no-sandbox",
                 f"--print-to-pdf={pdf_path}",
-                "--print-to-pdf-no-header",
-                primary_docs[0].resolve().as_uri(),
+                "--no-pdf-header-footer",
+                primary_doc.resolve().as_uri(),
             ],
             check=True,
             capture_output=True,
